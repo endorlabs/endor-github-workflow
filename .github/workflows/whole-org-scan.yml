@@ -1,0 +1,40 @@
+name: Scan Complete Organization
+on:
+  workflow_dispatch:
+  # uncomment below and adjust to frequency to automatically run
+  # schedule:
+  #   - cron: 1 */2 * * *
+    
+jobs:
+  # TODO org-sync pattern
+
+  setup:
+    uses: endorlabs/endor-github-workflow/.github/workflows/find-unscanned.yml@v0
+    permissions:
+      id-token: write
+    with:
+      namespace: example
+      # Change below to set number of results; this should match your max-parallel
+      result-limit: 50
+    # uncomment below to use API auth instead of Actions OIDC; set secret to key and secret in the form key_id:key_secret
+    # secrets: 
+    #   endorlabs-api-auth: ${{ secrets.ENDORLABS_API_AUTH }}
+
+  scan-matrix:
+    needs: setup
+    strategy:
+      # fail-fast should be set false so that one scan failure doesn't stop the whole matrix
+      fail-fast: false
+      max-parallel: ${{ needs.setup.outputs.job-count }}
+      matrix: ${{ fromJson(needs.setup.outputs.matrix-json) }}
+    uses: endorlabs/endor-github-workflow/.github/workflows/scan-with-endorlabs.yml@v0
+    permissions:
+      id-token: write      # allows authentication to Endor Labs using Actions OIDC JWT Token
+      pull-requests: write # allows scanner to leave a pull request comment, if enabled
+      issues: write        # allows scanner to leave a PR comment, if enabled
+      contents: read       # allows this job to clone org repos
+    with:
+      git-url: ${{ matrix.git-url }}
+      namespace: example
+    secrets:
+      endorlabs-api-auth: ${{ secrets.ENDORLABS_API_AUTH }}

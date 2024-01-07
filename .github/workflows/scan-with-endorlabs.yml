@@ -1,0 +1,198 @@
+# this workflow is a reusable flow to scan a repo using autobuild as a sidecar job
+# _REQUIRES a LINUX runner on an amd64-compatible arch, with bash >= 4.0 available and curl installed
+name: Scan Repo with Endor Labs @ v0
+on:
+  workflow_call:
+    inputs:
+      git-url:
+        description: git URL for repository to scan
+        required: true
+        type: string
+      namespace:
+        description: Endor Labs namespace (tenant name) for authentication/findings
+        required: true
+        type: string
+      is-pr:
+        description: Do not monitor this version; set true when you're scanning a Pull request
+        type: boolean
+        default: false
+      git-branch:
+        description: the branch of the target repo we wish to scan; if empty, scan the default branch
+        required: false
+        type: string
+      upload-logs:
+        description: "upload logs as artifacts (default: false)"
+        type: boolean
+        default: false
+      upload-json:
+        description: "upload json results as artifact (default: false)"
+        type: boolean
+        default: false
+      upload-sarif:
+        description: "upload SARIF results to GitHub for consumption in Security Tab (requires public repo or GHAS license); use only when sidecar-scanning within a repo!"
+        type: boolean
+        default: false
+      endorlabs-api-url:
+        description: "URL to use for Endor Labs root API (default = 'https://api.endorlabs.com')"
+        required: false
+        type: string
+        default: "https://api.endorlabs.com"
+      env-file:
+        description: Path to file that contains endor environment configuration
+        required: false
+        type: string
+        default: ".endorlabs/environment"
+      runner:
+        description: "Runner to use (default: 'ubuntu-22.04')"
+        required: false
+        type: string
+        default: "ubuntu-22.04"
+    secrets:
+      endorlabs-api-auth:
+        description: "API auth data in the form KEY:SECRET -- if present, disables GitHub Action OIDC auth"
+        required: false
+
+jobs:
+  endorlabs-auto-scan:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write      # allows authentication to Endor Labs using Actions OIDC JWT Token
+      contents: read       # allows this job to clone org repos
+    env:
+      ENDOR_API: ${{ inputs.endorlabs-api-url }}
+      ENDOR_NAMESPACE: ${{ inputs.namespace }}
+      ENDOR_HOME: ".endorlabs-workflow"
+      ENDOR_OS: linux
+      ENDOR_ARCH: amd64
+      ENDOR_GITHUB_ACTION_TOKEN_ENABLE: "true"
+      ENDOR_SCAN_SUMMARY_OUTPUT_TYPE: "json"
+      ENDOR_SCAN_PR: ${{ inputs.is-pr }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - id: safety-check
+        name: Check safety of inputs
+        shell: bash
+        run: |
+          shopt -s nocasematch
+          if ! [[ "$ENDOR_NAMESPACE" =~ ^[a-z0-9_-]+([.][a-z0-9_-]+)*$ ]]; then 
+            echo "::error::namespace input does not conform to namespace format"
+            exit 1
+          fi
+          shopt -u nocasematch
+          if ! [[ "$ENDOR_API" =~ ^https://[^/]+\.endorlabs.com$ ]]; then
+            echo "::error::endor API URL input does not use a *.endorlabs.com host, or does not start with https://"
+            exit 2
+          fi
+
+      - id: endorlabs-clone
+        name: clone ${{ inputs.git-url }}
+        shell: bash
+        env:
+          CLONE_URL: "${{ inputs.git-url }}"
+        run: |
+          if (git clone "${CLONE_URL}" "project"); then
+            >&2 echo "Cloned '${CLONE_URL}' successfully using bare git"
+          else
+            >&2 echo "Failed to clone '${CLONE_URL}' with bare git, trying gh"
+            if ! (gh repo clone "${CLONE_URL}" "project"); then
+              echo "::error::unable to clone '${CLONE_URL}' with any supported method"
+              exit 1
+            fi
+          fi
+        
+      - id: endorlabs-setup
+        name: install endorlabs client
+        shell: bash
+        env:
+          ENDORLABS_API_AUTH: ${{ secrets.endorlabs-api-auth }}
+          ENDORLABS_ENV_FILE: ${{ inputs.env-file }}
+        run: |
+          if [[ -f "${ENDORLABS_ENV_FILE}" ]]; then
+            grep -E '^ENDOR_' "${ENDORLABS_ENV_FILE}" >> $GITHUB_ENV
+            echo "::group::added repo environment hints from ${ENDORLABS_ENV_FILE}'"
+            grep -E '^ENDOR_' "${ENDORLABS_ENV_FILE}"
+            echo "::endgroup::"
+          fi
+          mkdir -p "${ENDOR_HOME}"
+          curl -o "${ENDOR_HOME}/endorctl" ${ENDOR_API}/download/latest/endorctl_${ENDOR_OS}_${ENDOR_ARCH}
+          echo "$(curl -s https://api.endorlabs.com/sha/latest/endorctl_linux_amd64)  ${ENDOR_HOME}/endorctl" | sha256sum -c || exit 1
+          chmod +x "${ENDOR_HOME}/endorctl"
+          if [[ -n "$ENDORLABS_API_AUTH" ]]; then
+            echo "::notice::Disabling GitHub Actions OIDC auth for Endor Labs, using API key auth instead"
+            echo "ENDOR_API_CREDENTIALS_KEY=$(cut -d: -f1 <<< ${ENDORLABS_API_AUTH})" >> $GITHUB_ENV
+            echo "ENDOR_API_CREDENTIALS_SECRET=$(cut -d: -f2 <<< ${ENDORLABS_API_AUTH})" >> $GITHUB_ENV
+            echo "ENDOR_GITHUB_ACTION_TOKEN_ENABLE=false" >> $GITHUB_ENV
+          fi
+      
+      - id: endorlabs-host-check
+        name: perform host check
+        shell: bash
+        run: |
+          LANGUAGES=""
+          "${ENDOR_HOME}/endorctl" host-check --path=project --droid-gpt 2> >(tee "${ENDOR_HOME}/host-check.log" >&2)
+          for lang in $(sed -nr 's/^.*Checking ([a-z_-]+) toolset.*$/\1/p' "${ENDOR_HOME}/host-check.log"); do LANGUAGES="${lang},$LANGUAGES"; done
+          if [[ -n "$LANGUAGES" ]]; then
+            if [[ -z "$ENDOR_SCAN_LANGUAGES" ]]; then
+              # only do this if the repo env hasn't manually set languages
+              # echo "ENDOR_SCAN_LANGUAGES=${LANGUAGES::-1}" >> $GITHUB_ENV  ## TODO: decide if we really want to do this
+              >&2 echo "::notice::Detected languages: ${LANGUAGES::-1}"
+            fi
+          fi
+
+      - id: endorlabs-scan-ref
+        name: scan branch of ${{ inputs.git-url }}
+        shell: bash
+        env:
+          SCAN_BRANCH: ${{ inputs.git-branch }}
+          CLONE_URL: "${{ inputs.git-url }}"
+          MAKE_SARIF: ${{ inputs.upload-sarif }}
+        run: |
+          if [[ -z "$ENDOR_SCAN_LANGUAGES" ]]; then
+            echo "::warning::No supported languages were detected to scan; check prior step for details. Scanning without language constraint list"
+          fi
+          if [[ -n "$SCAN_BRANCH" ]]; then
+            echo "::notice::Scanning requested ref '${SCAN_BRANCH}'"
+            git checkout "${SCAN_BRANCH}"
+          else
+            echo "::notice::Scanning default branch"
+          fi
+          if [[ "$MAKE_SARIF" == "true" ]]
+          then
+            echo "::notice::SARIF output requested for submission to GitHub"
+            ENDOR_SCAN_SUMMARY_SARIF_FILE="${ENDOR_HOME}/scan-results-${GITHUB_JOB}.sarif"
+          fi
+          "${ENDOR_HOME}/endorctl" scan --path ./project --bypass-host-check --build --verbose 2> >(tee "${ENDOR_HOME}/default-scan.log" >&2) > "${ENDOR_HOME}/scan-results-${GITHUB_RUN_ID}.json"
+          echo "results-json=${ENDOR_HOME}/scan-results-${GITHUB_RUN_ID}.json" >> $GITHUB_OUTPUT
+          echo "results-sarif=$ENDOR_SCAN_SUMMARY_SARIF_FILE" >> $GITHUB_OUTPUT
+          echo "github-run-id=$(echo $CLONE_URL|sed -r 's/[^a-z0-9_-]+/_/g')-${GITHUB_RUN_ID}" >> $GITHUB_OUTPUT
+
+      - id: endorlabs-upload-json-results
+        name: upload scan results as artifacts
+        if: inputs.upload-json
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: endorlabs-scan-results-${{ steps.endorlabs-scan-ref.outputs.github-run-id }}
+          path: ${{ steps.endorlabs-scan-ref.outputs.results-json }}
+          if-no-files-found: warn
+      
+      - id: endorlabs-upload-scan-logs
+        name: upload scan logs as artifacts
+        if: inputs.upload-logs == true
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: endorlabs-scan-logs-${{ steps.endorlabs-scan-ref.outputs.github-run-id }}
+          path: ${{ env.ENDOR_HOME }}/*.log
+          if-no-files-found: warn
+
+      - id: endorlabs-submit-sarif
+        name: submit SARIF output to GitHub
+        if: inputs.upload-sarif == true
+        uses: github/codeql-action/upload-sarif@v2
+        continue-on-error: true
+        with:
+          sarif_file: ${{ steps.endorlabs-scan-ref.outputs.results-sarif }}
+          checkout_path: "${{ github.workspace }}/project"
+          wait-for-processing: false
+        

@@ -1,0 +1,142 @@
+name: Enumerate unscanned repos @ v0
+on:
+  workflow_call:
+    inputs:
+      namespace:
+        description: Endor Labs namespace (tenant name) for authentication/findings
+        required: true
+        type: string
+      result-limit:
+        description: limit the number of repo URLs to return for the consuming matrix (GitHub max is 256)
+        type: number
+        default: 50
+      endorlabs-api-url:
+        description: "URL to use for Endor Labs root API (default = 'https://api.endorlabs.com')"
+        required: false
+        type: string
+        default: "https://api.endorlabs.com"
+      runner:
+        description: "Runner to use (default: 'ubuntu-22.04')"
+        required: false
+        type: string
+        default: "ubuntu-22.04"
+      hours:
+        description: "enumerate repos with no scan newer than this many hours ago"
+        type: number
+        default: 24
+      do-orgsync:
+        description: "perform an org-sync commmand prior to finding unscanned Projects"
+        type: boolean
+        default: false
+    secrets:
+      endorlabs-api-auth:
+        description: "API auth data in the form KEY:SECRET -- if present, disables GitHub Action OIDC auth"
+        required: false
+    outputs:
+      matrix-json:
+        description: Matrix specification for git-url, in JSON format
+        value: ${{ jobs.enumerate-repos.outputs.matrix-json }}
+      job-count:
+        description: the number of jobs returned
+        value: ${{ jobs.enumerate-repos.outputs.job-count }}
+
+jobs:
+  enumerate-repos:
+    runs-on: ${{ inputs.runner }}
+    permissions:
+      id-token: write      # allows authentication to Endor Labs using Actions OIDC JWT Token
+    env:
+      ENDOR_API: ${{ inputs.endorlabs-api-url }}
+      ENDOR_NAMESPACE: ${{ inputs.namespace }}
+      ENDOR_HOME: ".endorlabs-workflow"
+      ENDOR_OS: linux
+      ENDOR_ARCH: amd64
+      ENDOR_GITHUB_ACTION_TOKEN_ENABLE: "true"
+      ENDOR_SCAN_SUMMARY_OUTPUT_TYPE: "json"
+      MAX_REPOS: ${{ inputs.result-limit }}
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      matrix-json: ${{ steps.enumerate-to-scan.outputs.matrix-json }}
+      job-count: ${{ steps.enumerate-to-scan.outputs.job-count}}
+    steps:
+      - id: safety-check
+        name: Check safety of inputs
+        shell: bash
+        run: |
+          shopt -s nocasematch
+          [[ "$ENDOR_NAMESPACE" =~ ^[a-z0-9_-]+([.][a-z0-9_-]+)*$ ]]|| exit 1
+          shopt -u nocasematch
+          [[ "$ENDOR_API" =~ ^https://[^/]+\.endorlabs.com$ ]] || exit 2
+          [[ "$MAX_REPOS" -gt 256 ]] || exit 3
+          [[ "$MAX_REPOS" -lt 1 ]] || exit 4
+        
+      - id: endorlabs-setup
+        name: install endorlabs client
+        shell: bash
+        env:
+          ENDORLABS_API_AUTH: ${{ secrets.endorlabs-api-auth }}
+        run: |
+          mkdir -p "${ENDOR_HOME}"
+          curl -o "${ENDOR_HOME}/endorctl" ${ENDOR_API}/download/latest/endorctl_${ENDOR_OS}_${ENDOR_ARCH}
+          echo "$(curl -s https://api.endorlabs.com/sha/latest/endorctl_linux_amd64)  ${ENDOR_HOME}/endorctl" | sha256sum -c || exit 1
+          chmod +x "${ENDOR_HOME}/endorctl"
+          if [[ -n "$ENDORLABS_API_AUTH" ]]; then
+            echo "::notice Disabling GitHub Actions OIDC auth for Endor Labs, using API key auth instead"
+            echo "ENDOR_API_CREDENTIALS_KEY=$(cut -d: -f1 <<< ${ENDORLABS_API_AUTH})" >> $GITHUB_ENV
+            echo "ENDOR_API_CREDENTIALS_SECRET=$(cut -d: -f2 <<< ${ENDORLABS_API_AUTH})" >> $GITHUB_ENV
+            echo "ENDOR_GITHUB_ACTION_TOKEN_ENABLE=false" >> $GITHUB_ENV
+          fi
+
+      - id: org-sync
+        name: Create projects for unseen repos in this GitHub org
+        if: inputs.do-orgsync == true
+        continue-on-error: true
+        run: "${ENDOR_HOME}/endorctl sync-org --name ${{ github.repository_owner }}"
+
+      - id: enumerate-to-scan
+        name: find repos that haven't had a default branch monitor scan in ${{ inputs.hours }} hours
+        env:
+          OLDER_THAN_HOURS: ${{ inputs.hours }}
+        run: |
+          MAX_REPOS=${MAX_REPOS:-255}
+          ENDOR_HOME=${ENDOR_HOME:-$PWD}
+          OLDER_THAN_SECONDS=$((OLDER_THAN_HOURS * 3600))
+          >&2 echo "Getting Scan Results"
+          # TODO - learn to filter by date at this level
+          "${ENDOR_HOME}/endorctl" api list -r ScanResult --filter='meta.parent_kind==Project and spec.exit_code==ENDORCTL_RC_SUCCESS and spec.environment.config.RunBySystem==false and spec.environment.config.CIRunUUID==""' --field-mask context,meta,uuid --list-all > "${ENDOR_HOME}/scans.json"
+          >&2 echo "Getting Projects"
+          "${ENDOR_HOME}/endorctl" api list -r Project  --filter='processing_status.scan_state==SCAN_STATE_IDLE' --field-mask meta,spec.git.http_clone_url,uuid --list-all > "${ENDOR_HOME}/projects.json"
+
+          FS=$'\n'
+          GIT_URLS=()
+          for PROJ_UUID in $(jq -r '.list.objects[]|.uuid' "${ENDOR_HOME}/projects.json" | sort -u)
+          do
+              if CTIME=$(jq -er "[.list.objects[]|select(.meta.parent_uuid==\"$PROJ_UUID\")|.meta.create_time][-1]" "${ENDOR_HOME}/scans.json"); then
+                  >&2 echo "Project $PROJ_UUID has a scan on record at $CTIME"
+                  if python3 -c "import datetime; ((datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat('$CTIME')).total_seconds() < $OLDER_THAN_SECONDS) and exit(1)"; then
+                      >&2 echo "  But it's older than 24 hours, so adding it anyway"
+                      CLONE_URL=$(jq -r ".list.objects[]|select(.uuid==\"$PROJ_UUID\")|.spec.git.http_clone_url" "${ENDOR_HOME}/projects.json")
+                      >&2 echo "  Adding $CLONE_URL, because it has only older scans"
+                      GIT_URLS+=("$CLONE_URL")
+                  fi
+              else
+                  CLONE_URL=$(jq -r ".list.objects[]|select(.uuid==\"$PROJ_UUID\")|.spec.git.http_clone_url" "${ENDOR_HOME}/projects.json")
+                  >&2 echo "Adding $CLONE_URL, because it has no scans"
+                  GIT_URLS+=("$CLONE_URL")
+              fi
+          done
+
+          COUNTER=0
+          OUTPUT="{ \"git-url\": ["
+          for URL in ${GIT_URLS[@]}
+          do
+              OUTPUT+="  \"$URL\","
+              COUNTER=$((COUNTER+1))
+              if [[ $COUNTER -gt $MAX_REPOS ]]; then
+                  >&2 echo "::warning Stopping because we met the configured maximum of $MAX_REPOS repos"
+              break; fi
+          done
+          OUTPUT+="]}"
+          echo "::notice Providing $COUNTER repos for matrix"
+          echo "matrix-json=$OUTPUT" >> $GITHUB_OUTPUT
+          echo "job-count=$(jq -r '.git-url[]|length' <<< ${OUTPUT} )"
