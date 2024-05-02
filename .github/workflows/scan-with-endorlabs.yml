@@ -51,6 +51,9 @@ on:
       endorlabs-api-auth:
         description: "API auth data in the form KEY:SECRET -- if present, disables GitHub Action OIDC auth"
         required: false
+      github-access-token:
+        description: "github access token to use instead of default Actions token; may be required to clone private repos"
+        required: false
 
 jobs:
   endorlabs-auto-scan:
@@ -67,7 +70,7 @@ jobs:
       ENDOR_GITHUB_ACTION_TOKEN_ENABLE: "true"
       ENDOR_SCAN_SUMMARY_OUTPUT_TYPE: "json"
       ENDOR_SCAN_PR: ${{ inputs.is-pr }}
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.github-access-token || github.token }}
     steps:
       - id: safety-check
         name: Check safety of inputs
