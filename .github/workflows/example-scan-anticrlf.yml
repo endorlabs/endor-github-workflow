@@ -17,3 +17,7 @@ jobs:
       is-pr: true
     secrets:
       endorlabs-api-auth: ${{ secrets.ENDORLABS_API_AUTH }}
+      # to operate on a private repo, generate a github access token with `repo` rights
+      # and create an orgization or repository secret named `GITHUB_ACCESS_TOKEN`, then
+      # uncomment the line below
+      # github-access-token: ${{ secrets.GITHUB_ACCESS_TOKEN }}
